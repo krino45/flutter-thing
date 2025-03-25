@@ -7,7 +7,7 @@ from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QScrollArea, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QFileDialog, QLabel, QMenu, QMenuBar,
                              QStatusBar, QMessageBox, QSizePolicy, QSplitter, QAction)
-from PyQt5.QtCore import QDir, Qt, QFileSystemWatcher, QTimer
+from PyQt5.QtCore import QDir, Qt, QFileSystemWatcher, QTimer, QRunnable, QThreadPool, pyqtSignal, QObject
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # Import the analysis module
@@ -113,6 +113,7 @@ class ScrollableResults(QWidget):
 
 
 class FileTab(QWidget):
+    analysis_complete = pyqtSignal()
     """Tab for a single analysis file"""
     def __init__(self, parent, file_path, dir_path):
         super().__init__(parent)
@@ -179,29 +180,49 @@ class FileTab(QWidget):
         # Add splitter to main layout
         main_layout.addWidget(splitter)
         
+        self.threadpool = QThreadPool()
+        
         # Analyze the file
         self.analyze_file()
         
     def analyze_file(self):
-        """Run flutter analysis on the file"""
-        try:
-            velocities, frequencies, dampings, roots = analyzer.get_flutter(self.file_name, self.dir_path)
-            self.result_cache = (velocities, frequencies, dampings, roots)
-            
-            # Update the plot
-            self.canvas.plot_vg(velocities, frequencies, dampings, self.modes, self.file_name)
-            
-            # Update the results text
-            results_text = "Flutter Roots:\n"
-            for mode, values in roots.items():
-                if len(values) > 0:
-                    values_str = ", ".join([f"{x:.3f}" for x in values])
-                    results_text += f"Mode {mode+1}: {values_str}\n"
-            
-            self.results_label.setText(results_text)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Analysis Error", f"Error analyzing file: {str(e)}")
+        """Run flutter analysis on the file using a worker thread"""
+        # Show loading state
+        self.results_label.setText("Анализ файла...")
+        self.recalculate_btn.setEnabled(False)
+        
+        # Create and start worker
+        worker = AnalysisWorker(self.file_name, self.dir_path)
+        worker.signals.result.connect(self.on_analysis_complete)
+        worker.signals.error.connect(self.on_analysis_error)
+        worker.signals.finished.connect(self.on_analysis_finished)
+        self.threadpool.start(worker)
+
+    def on_analysis_complete(self, result):
+        """Handle successful analysis"""
+        velocities, frequencies, dampings, roots = result
+        self.result_cache = (velocities, frequencies, dampings, roots)
+        
+        # Update the plot
+        self.canvas.plot_vg(velocities, frequencies, dampings, self.modes, self.file_name)
+        
+        # Update the results text
+        results_text = "Flutter Roots:\n"
+        for mode, values in roots.items():
+            if len(values) > 0:
+                values_str = ", ".join([f"{x:.3f}" for x in values])
+                results_text += f"Mode {mode+1}: {values_str}\n"
+        self.results_label.setText(results_text)
+
+    def on_analysis_error(self, error_message):
+        """Handle analysis errors"""
+        QMessageBox.critical(self, "Analysis Error", f"Error analyzing file: {error_message}")
+
+    def on_analysis_finished(self):
+        """Handle analysis completion"""
+        self.recalculate_btn.setEnabled(True)
+        self.analysis_complete.emit()
+        
             
     def set_modes(self, modes):
         """Set which modes to display"""
@@ -285,6 +306,14 @@ class FlutterAnalyzer(QMainWindow):
         self.file_tabs = {}  # Dictionary to track open tabs
         self.watcher = QFileSystemWatcher()
         self.watcher.directoryChanged.connect(self.handle_directory_changed)
+        self.files_processed = 0
+        self.checked_modes = [False] * 10
+
+        self.file_queue = []  # Queue for files to process
+        self.threadpool = QThreadPool.globalInstance()  # Use global thread pool
+        self.threadpool.setMaxThreadCount(8) 
+        self.processing = False  # Flag to track if we're processing the queue
+
         
         self.init_ui()
         self.load_config()
@@ -384,9 +413,6 @@ class FlutterAnalyzer(QMainWindow):
         
         self.setMenuBar(menu_bar)
 
-    
-    checked_modes = [False] * 10
-
     def set_all_modes(self, mode, checked):
         self.checked_modes[mode] = checked
         curr_modes = []
@@ -394,8 +420,7 @@ class FlutterAnalyzer(QMainWindow):
             if self.checked_modes[i]:
                 curr_modes.append(i)
         self.set_modes_for_current_tab(curr_modes) 
-
-        
+    
     def set_modes_for_current_tab(self, modes):
         """Set modes for the current tab"""
         current_tab = self.tab_widget.currentWidget()
@@ -437,22 +462,34 @@ class FlutterAnalyzer(QMainWindow):
             if not files:
                 self.statusBar.showMessage("Не найдено файлов с расширением f06")
                 return
-                
-            # Add a tab for each file
-            for file_name in files:
-                self.add_file_tab(file_name)
-                
-            self.statusBar.showMessage(f"Загружено файлов: {len(files)}")
+
+            self.files_processed = 0
+            self.total_files = len(files)
+            self.file_queue = files
+
+            self.statusBar.showMessage(f"Найдено файлов: {self.total_files}")
+            self.process_next_file()
             
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не получилось загрузить файл: {str(e)}")
+    
+    def process_next_file(self):
+        """Process the next file in the queue"""
+        if not self.file_queue or self.processing:
+            return
             
+        self.processing = True
+        file_name = self.file_queue.pop(0)
+        self.add_file_tab(file_name)
+    
     def add_file_tab(self, file_name):
         """Add a new tab for the specified file"""
         if file_name in self.file_tabs:
             # File already open, just switch to its tab
             tab_index = self.tab_widget.indexOf(self.file_tabs[file_name])
             self.tab_widget.setCurrentIndex(tab_index)
+            self.processing = False
+            self.process_next_file()
             return
             
         file_path = os.path.join(self.current_dir, file_name)
@@ -466,13 +503,27 @@ class FlutterAnalyzer(QMainWindow):
             tab = FileTab(self, file_path, self.current_dir)
             tab_index = self.tab_widget.addTab(tab, file_name)
             self.file_tabs[file_name] = tab
+
+            tab.analysis_complete.connect(self.on_tab_complete)
             
             # Switch to the new tab
-            self.tab_widget.setCurrentIndex(tab_index)
+            # self.tab_widget.setCurrentIndex(tab_index)
             
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не получилось загрузить файл {file_name}: {str(e)}")
-            
+            self.processing = False
+            self.process_next_file()
+    
+    def on_tab_complete(self):
+        """Handle completion of a tabs analysis"""
+        self.files_processed += 1
+        self.statusBar.showMessage(f"Обработано {self.files_processed}/{self.total_files} файлов")
+        if self.files_processed >= self.total_files:
+            self.files_processed = 0
+        self.processing = False
+        self.process_next_file()
+        
+
     def close_tab(self, index):
         """Close the tab at the specified index"""
         widget = self.tab_widget.widget(index)
@@ -569,10 +620,12 @@ class FlutterAnalyzer(QMainWindow):
         event.accept()
 
 class TabBar(QtWidgets.QTabBar):
+    """A QTabBar with vertical text and a draggable resize handle on the right."""
     def __init__(self, parent=None):
-        super(TabBar, self).__init__(parent)
+        super().__init__(parent)
         self.setFont(QtGui.QFont("Arial", 12))
         
+        # Basic tab styling
         self.setStyleSheet("""
             QTabBar::tab {
                 background: #f0f0f0;
@@ -588,23 +641,40 @@ class TabBar(QtWidgets.QTabBar):
             }
         """)
 
+        # Resize‐handle properties
+        self._resizing = False
+        self._resize_handle_width = 8
+        self._min_width = 5
+        self._max_width = 480
+        self._drag_start_x = 0
+        self._initial_width = 0
+        self.setMouseTracking(True)
+
     def tabSizeHint(self, index):
+        """
+        Returns a size that accounts for the rotated text. 
+        You can adjust the +40 / +20 padding to taste.
+        """
         fm = QtGui.QFontMetrics(self.font())
         text = self.tabText(index)
-        text_width = fm.width(text) + 40 
+        text_width = fm.width(text) + 40
         text_height = fm.height() + 20
 
-        s = QtWidgets.QTabBar.tabSizeHint(self, index)
-        s.transpose()
+        # Call the base class to get a default size, then transpose.
+        base_size = super().tabSizeHint(index)
+        base_size.transpose()
+
         return QtCore.QSize(
-            min(max(s.width(), text_width), 500),
-            min(max(s.height(), text_height), 500)   
+            min(max(base_size.width(), text_width), 500),
+            min(max(base_size.height(), text_height), 500)
         )
 
     def paintEvent(self, event):
+        """Paint the vertical tabs + draw a small resize handle line on the right edge."""
         painter = QtWidgets.QStylePainter(self)
         opt = QtWidgets.QStyleOptionTab()
 
+        # Draw each tab with rotated text
         for i in range(self.count()):
             self.initStyleOption(opt, i)
             painter.drawControl(QtWidgets.QStyle.CE_TabBarTabShape, opt)
@@ -621,17 +691,87 @@ class TabBar(QtWidgets.QTabBar):
             painter.translate(c)
             painter.rotate(90)
             painter.translate(-c)
-            
-            # Draw the text
             painter.drawControl(QtWidgets.QStyle.CE_TabBarTabLabel, opt)
             painter.restore()
 
+        # Draw a vertical line to represent the "resize handle"
+        handle_x = self.width() - 2
+        painter.setPen(QtGui.QPen(QtGui.QColor("#999999"), 2))
+        painter.drawLine(handle_x, 5, handle_x, self.height() - 5)
+
+    def mousePressEvent(self, event):
+        """
+        If the mouse is near the right edge, begin resizing;
+        otherwise, pass the event on for normal tab selection.
+        """
+        if self._on_resize_handle(event.pos()):
+            self._resizing = True
+            self._drag_start_x = event.pos().x()
+            self._initial_width = self.width()
+            self.setCursor(QtCore.Qt.SizeHorCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resizing:
+            # Calculate how much the user has dragged horizontally
+            delta = event.pos().x() - self._drag_start_x
+            old_width = self._initial_width
+            new_width = old_width + delta
+            # Clamp to our min/max
+            new_width = max(self._min_width, min(self._max_width, new_width))
+            self.setFixedWidth(new_width)
+            parent = self.parent()
+            if isinstance(parent, QtWidgets.QTabWidget):
+                # Update content margin to match new width
+                parent.setStyleSheet(f"""
+                    QTabWidget::pane {{
+                        margin-left: {delta}px;
+                        border: 1px solid #cccccc;
+                        border-left: none;
+                    }}
+                """)
+            event.accept()
+        else:
+            # Change cursor if hovering on the handle
+            if self._on_resize_handle(event.pos()):
+                self.setCursor(QtCore.Qt.SizeHorCursor)
+            else:
+                self.setCursor(QtCore.Qt.ArrowCursor)
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._resizing:
+            self._resizing = False
+            self.setCursor(QtCore.Qt.ArrowCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def _on_resize_handle(self, pos: QtCore.QPoint) -> bool:
+        """Return True if mouse is within the resize handle region on the right."""
+        return (self.width() - pos.x()) < self._resize_handle_width
+
 
 class TabWidget(QtWidgets.QTabWidget):
-    def __init__(self, *args, **kwargs):
-        QtWidgets.QTabWidget.__init__(self, *args, **kwargs)
-        self.setTabBar(TabBar())
+    """A QTabWidget using our TabBar, oriented on the West side.
+       The content pane’s margin-left is updated dynamically so that it 
+       always starts immediately after the tab bar.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabBar(TabBar(self))
         self.setTabPosition(QtWidgets.QTabWidget.West)
+        self.setDocumentMode(False)
+        self.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #cccccc;
+                border-left: none; 
+            }
+        """)
+
+
 
 class ProxyStyle(QtWidgets.QProxyStyle):
     def drawControl(self, element, opt, painter, widget):
@@ -643,6 +783,31 @@ class ProxyStyle(QtWidgets.QProxyStyle):
             r.moveBottom(opt.rect.bottom())
             opt.rect = r
         QtWidgets.QProxyStyle.drawControl(self, element, opt, painter, widget)
+
+class WorkerSignals(QObject):
+    """Defines the signals available from a running worker thread"""
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    result = pyqtSignal(tuple)  # (velocities, frequencies, dampings, roots)
+
+class AnalysisWorker(QRunnable):
+    """Worker thread for running flutter analysis"""
+    def __init__(self, file_name, dir_path):
+        super().__init__()
+        self.file_name = file_name
+        self.dir_path = dir_path
+        self.signals = WorkerSignals()
+
+    def run(self):
+        """Perform the analysis in a separate thread"""
+        try:
+            velocities, frequencies, dampings, roots = analyzer.get_flutter(
+                self.file_name, self.dir_path)
+            self.signals.result.emit((velocities, frequencies, dampings, roots))
+        except Exception as e:
+            self.signals.error.emit(str(e))
+        finally:
+            self.signals.finished.emit()
 
 def main():
     """Main application entry point"""
